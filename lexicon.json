@@ -1,0 +1,9 @@
+[
+ {"pattern": "(?<=\\d),(?=\\d{3}\\b)", "replace": "", "note": "44,810 -> 44810 (thousands separator)"},
+ {"pattern": "(\\d+(?:\\.\\d+)?)\\s*[–—~～]\\s*(\\d+(?:\\.\\d+)?)\\s*%", "replace": "\\1% 到 \\2%", "note": "30–60% -> 30% 到 60%"},
+ {"pattern": "(\\d+(?:\\.\\d+)?)\\s*[–—~～]\\s*(\\d+(?:\\.\\d+)?)", "replace": "\\1 到 \\2", "note": "0.38–0.98 -> 0.38 到 0.98"},
+ {"pattern": "\\b([A-Za-z]+\\d+)/([A-Za-z]+\\d+)\\b", "replace": "\\1 和 \\2", "note": "HP1/HP2 -> HP1 和 HP2"},
+ {"pattern": "(?<=\\d)\\s*Gb\\b", "replace": " G b", "note": "edit to taste, e.g. 十億鹼基"},
+ {"pattern": "(?<=\\d)\\s*Mb\\b", "replace": " M b", "note": "edit to taste, e.g. 百萬鹼基"},
+ {"pattern": "(?<=\\d)\\s*kb\\b", "replace": " k b", "note": "edit to taste, e.g. 千鹼基"}
+]
