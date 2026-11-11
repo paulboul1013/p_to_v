@@ -36,18 +36,3 @@ python scripts/p_to_v.py 簡報.pptx --start-from tts --title "主標題"
 3. 第三行合成配音並產出影片。
 
 完整流程、標記語法和參數說明見 [SKILL.md](SKILL.md)。
-
-## 檔案
-
-| 檔案 | 用途 |
-|---|---|
-| `SKILL.md` | skill 說明：給 Claude 的完整工作流程 |
-| `scripts/p_to_v.py` | 總控制：事前檢查、各步驟、數量檢查 |
-| `scripts/export_slides.ps1` | 用 PowerPoint COM 匯出投影片圖片和版面資訊 |
-| `scripts/extract_text.py` | 抽出投影片文字和備忘稿，產生講稿草稿 |
-| `scripts/tts.py`、`tts_engines.py`、`sapi_tts.ps1` | 配音：一句一句合成、快取、讀音字典、引擎自動備援 |
-| `scripts/effects.py`、`export_states.ps1` | 逐項出現和打亮效果 |
-| `scripts/build.py` | 合成影片：鏡頭運動、轉場、字幕、章節 |
-| `scripts/qa.py` | 自動品質檢查和縮圖總覽 |
-| `lexicon.json` | 內建讀音規則 |
-| `改進建議.md` | 調查報告與後續可做的改進 |
