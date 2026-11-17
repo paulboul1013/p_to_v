@@ -6,6 +6,8 @@
   python p_to_v.py deck.pptx --start-from tts --title "..." --subtitle "..."
 
 WORK defaults to %TEMP%/p_to_v/<deck name>; it is printed at the start.
+Narration sentences and rendered clips are cached in %TEMP%/p_to_v/_cache (--cache-dir), shared by
+all WORK folders, so re-running after editing a few sentences or one slide only redoes those parts.
 """
 import argparse, glob, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
 
@@ -76,6 +78,9 @@ def main():
     ap.add_argument("--slides", type=int, default=0, help="only the first N visible slides (quick test)")
     ap.add_argument("--start-from", choices=STEPS, default="slides")
     ap.add_argument("--stop-after", choices=STEPS, default="qa")
+    ap.add_argument("--cache-dir", default="",
+                    help="shared cache for narration and clips (default %%TEMP%%/p_to_v/_cache)")
+    ap.add_argument("--cache-max-gb", type=float, default=5.0, help="clip cache size limit (LRU pruned)")
     a = ap.parse_args()
 
     if a.check:
@@ -94,8 +99,9 @@ def main():
         base, k = out[:-4], 2
         while os.path.exists(out):
             out = f"{base}_{k}.mp4"; k += 1
+    cache = os.path.abspath(a.cache_dir or os.path.join(tempfile.gettempdir(), "p_to_v", "_cache"))
     py = sys.executable
-    print(f"WORK = {work}\nOUT  = {out}\nsteps: {' -> '.join(todo)}", flush=True)
+    print(f"WORK = {work}\nOUT  = {out}\nCACHE = {cache}\nsteps: {' -> '.join(todo)}", flush=True)
 
     if "slides" in todo:
         call(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
@@ -117,7 +123,7 @@ def main():
 
     if "tts" in todo:
         cmd = [py, os.path.join(HERE, "tts.py"), work, "--engine", a.engine, "--voice", a.voice,
-               "--win-voice", a.win_voice, "--rate", a.rate]
+               "--win-voice", a.win_voice, "--rate", a.rate, "--cache", os.path.join(cache, "tts")]
         if a.lexicon: cmd += ["--lexicon", os.path.abspath(a.lexicon)]
         call(cmd)
     if "effects" in todo and not a.no_effects:
@@ -125,7 +131,8 @@ def main():
     if "clips" in todo or "final" in todo:
         cmd = [py, os.path.join(HERE, "build.py"), work, out, "--title", a.title or name,
                "--subtitle", a.subtitle, "--kicker", a.kicker, "--zoom", str(a.zoom), "--encoder", a.encoder,
-               "--start-from", "clips" if "clips" in todo else "final"]
+               "--start-from", "clips" if "clips" in todo else "final",
+               "--cache-dir", os.path.join(cache, "clips"), "--cache-max-gb", str(a.cache_max_gb)]
         if a.jobs: cmd += ["--jobs", str(a.jobs)]
         if a.no_intro: cmd.append("--no-intro")
         if a.no_subs: cmd.append("--no-subs")

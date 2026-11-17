@@ -4,14 +4,16 @@
 For slide i writes WORK/audio/a{i:03d}.wav (48 kHz mono) and a{i:03d}.json (exact sentence cues).
 - sentences are joined with controlled pauses (SSML <break> is no longer allowed by edge-tts)
 - a lexicon rewrites the *spoken* text only; subtitles keep the original wording
-- synthesized sentences are cached by sha1(engine|voice|rate|spoken text) in WORK/tts_cache
+- synthesized sentences are cached by sha1(engine|voice|rate|spoken text) in --cache
+  (p_to_v.py passes the shared %TEMP%/p_to_v/_cache/tts, so a new WORK or a revised deck reuses
+  every unchanged sentence; default WORK/tts_cache, which is also read as a fallback)
 - retries with exponential backoff; a dead engine is detected by a 1-sentence probe and skipped
 - the engine actually used is written to WORK/audio/engine.txt
 
 usage: python tts.py WORK [--engine auto|edge|windows] [--voice zh-TW-HsiaoChenNeural]
-                          [--rate +8%] [--lexicon extra.json]
+                          [--rate +8%] [--lexicon extra.json] [--cache DIR]
 """
-import argparse, array, asyncio, hashlib, json, os, re, sys, wave
+import argparse, array, asyncio, hashlib, json, os, re, shutil, sys, wave
 from tts_engines import ENGINES, ORDER
 
 SR = 48000
@@ -68,7 +70,7 @@ def write_wav(p, pcm):
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm.tobytes())
 
 
-def build_plan(script, rules, engine, cache):
+def build_plan(script, rules, engine, cache, legacy=None):
     plan, jobs = [], {}
     vid, rate = engine.voice_id(), engine.cfg["rate"]
     prefix = "" if engine.name == "edge" else engine.name + "|"   # keeps old edge caches valid
@@ -79,7 +81,11 @@ def build_plan(script, rules, engine, cache):
             key = hashlib.sha1(f"{prefix}{vid}|{rate}|{spoken}".encode("utf-8")).hexdigest()[:16]
             wp = os.path.join(cache, key + ".wav")
             if not os.path.exists(wp):
-                jobs[wp] = spoken
+                old = os.path.join(legacy, key + ".wav") if legacy else ""
+                if old and os.path.exists(old):
+                    shutil.copy2(old, wp)          # migrate from the per-WORK cache
+                else:
+                    jobs[wp] = spoken
             items.append((s, wp, marks, end_marks))
         plan.append(items)
     return plan, jobs
@@ -87,7 +93,7 @@ def build_plan(script, rules, engine, cache):
 
 async def probe(engine, cache):
     """Quick 1-sentence test so a dead service is detected in seconds, not after 5 retries x N sentences."""
-    wp = os.path.join(cache, f"_probe_{engine.name}.wav")
+    wp = os.path.join(cache, f"_probe_{engine.name}_{os.getpid()}.wav")   # cache may be shared
     try:
         if engine.name == "edge":
             await engine.synth_all({wp: "測試。"}, tries=2)
@@ -111,12 +117,16 @@ async def main():
     ap.add_argument("--rate", default="+8%")
     ap.add_argument("--lexicon", default="")
     ap.add_argument("--concurrency", type=int, default=2)
+    ap.add_argument("--cache", default="", help="sentence cache dir (default WORK/tts_cache)")
     a = ap.parse_args()
     work = os.path.abspath(a.work)
     with open(os.path.join(work, "script.json"), encoding="utf-8") as f:
         script = json.load(f)
     rules = load_lexicon([os.path.join(HERE, "..", "lexicon.json"), os.path.join(work, "lexicon.json"), a.lexicon])
-    cache = os.path.join(work, "tts_cache"); os.makedirs(cache, exist_ok=True)
+    legacy = os.path.join(work, "tts_cache")
+    cache = os.path.abspath(a.cache) if a.cache else legacy
+    os.makedirs(cache, exist_ok=True)
+    legacy = legacy if os.path.isdir(legacy) and os.path.normcase(legacy) != os.path.normcase(cache) else None
     out = os.path.join(work, "audio"); os.makedirs(out, exist_ok=True)
 
     cfg = {"voice": a.voice, "win_voice": a.win_voice, "rate": a.rate, "concurrency": a.concurrency}
@@ -127,7 +137,7 @@ async def main():
         ok, why = eng.available()
         if not ok:
             tried.append(f"{name}: skipped ({why})"); continue
-        plan, jobs = build_plan(script, rules, eng, cache)
+        plan, jobs = build_plan(script, rules, eng, cache, legacy)
         total = sum(len(x) for x in plan)
         if jobs:
             ok, why = await probe(eng, cache)

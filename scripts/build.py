@@ -2,12 +2,18 @@
 
 usage: python build.py WORK OUT.mp4 [--title T] [--subtitle S] [--kicker K] [--no-intro] [--no-subs]
                        [--zoom 0.07] [--bgm music.mp3] [--encoder libx264|h264_nvenc|h264_qsv]
-                       [--jobs N] [--start-from clips|final]
+                       [--jobs N] [--start-from clips|final] [--cache-dir DIR] [--cache-max-gb 5]
 
 Timeline is computed in whole frames; the narration is laid down as ONE track at absolute
 positions, so audio, video and subtitles cannot drift apart however many slides there are.
+
+Clip cache: every per-slide clip and every xfade join is named by a hash of what goes into it
+(image bytes, frame count, effect-state timing, camera move, encoder settings, and for joins the
+input clips + transitions). Anything unchanged is reused instead of re-rendered, also across WORK
+folders and deck revisions (default %TEMP%/p_to_v/_cache/clips). Least-recently-used files are
+pruned when the folder grows past --cache-max-gb. Delete the folder to force a full re-render.
 """
-import argparse, array, glob, json, math, os, re, subprocess, sys, wave
+import argparse, array, glob, hashlib, json, math, os, re, subprocess, sys, tempfile, threading, time, wave
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
@@ -21,12 +27,67 @@ FONT_DIR = "C:/Windows/Fonts"
 TRANS = ["fadeblack", "smoothleft", "circleopen", "slideleft", "wipeleft", "smoothup",
          "fade", "radial", "slideup", "dissolve"]
 MID = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", "-an"]
+CACHE_VER = 1                 # bump when clip rendering changes in a way the key does not capture
+PRE_VF = "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:black,"
 
 
 def run(cmd, cwd=None):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         print(" ".join(cmd)[:500]); print(r.stderr[-3000:]); sys.exit(1)
+
+
+_sha_memo = {}
+
+
+def file_sha(p):
+    st = os.stat(p)
+    k = (os.path.abspath(p), st.st_mtime_ns, st.st_size)
+    if k not in _sha_memo:
+        h = hashlib.sha1()
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        _sha_memo[k] = h.hexdigest()
+    return _sha_memo[k]
+
+
+def key_of(*parts):
+    return hashlib.sha1(json.dumps([CACHE_VER, *parts], ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
+
+
+def cache_hit(path):
+    if os.path.exists(path):
+        os.utime(path)            # mark as recently used for LRU pruning
+        return True
+    return False
+
+
+def part_of(path):
+    """temp name for an in-progress render; renamed into place only when ffmpeg succeeds"""
+    return f"{path[:-4]}.{os.getpid()}_{threading.get_ident()}.part.mp4"
+
+
+def prune(cdir, keep, max_bytes):
+    now, files = time.time(), []
+    for f in os.listdir(cdir):
+        p = os.path.join(cdir, f)
+        if f.endswith(".part.mp4"):
+            if now - os.path.getmtime(p) > 86400:     # leftovers of a crashed run
+                os.remove(p)
+            continue
+        if f.endswith(".mp4"):
+            files.append((os.path.getmtime(p), os.path.getsize(p), p))
+    total = sum(sz for _, sz, _ in files)
+    freed = 0
+    for _, sz, p in sorted(files):
+        if total - freed <= max_bytes:
+            break
+        if os.path.normcase(p) in keep:
+            continue
+        os.remove(p); freed += sz
+    if freed:
+        print(f"clip cache: pruned {freed / 1e9:.2f} GB (limit {max_bytes / 1e9:.1f} GB)", flush=True)
 
 
 def wav_len(p):
@@ -73,47 +134,69 @@ def moves(zm):
 SF = 9   # crossfade between effect states of one slide (0.3 s)
 
 
-def render_clip(work, imgs, out, nf, mv):
+def clip_key(work, imgs, nf, mv):
+    return key_of("clip", W, H, FPS, MID, SF, PRE_VF, nf, list(mv),
+                  [(st, file_sha(os.path.join(work, img))) for st, img in imgs])
+
+
+def render_clip(work, cdir, imgs, out, nf, mv, used):
     """imgs: [(start_frame, image)] (first start 0). One zoom/pan runs continuously over the whole
-    slide; each state is rendered as its own segment and states are crossfaded."""
-    pre = "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:black,"
+    slide; each state is rendered as its own segment and states are crossfaded.
+    out is a content-addressed file in the cache; returns True if it was already there."""
+    if cache_hit(out):
+        return True
     segs = []
     for j, (st, img) in enumerate(imgs):
         end = imgs[j + 1][0] + SF if j + 1 < len(imgs) else nf
         z, x, y = (s.format(n=nf, on=f"on+{st}") for s in mv)
-        vf = f"{pre}zoompan=z='{z}':x='{x}':y='{y}':d={end - st}:s={W}x{H}:fps={FPS},format=yuv420p"
-        seg = out if len(imgs) == 1 else out[:-4] + f"_s{j}.mp4"
+        vf = f"{PRE_VF}zoompan=z='{z}':x='{x}':y='{y}':d={end - st}:s={W}x{H}:fps={FPS},format=yuv420p"
+        seg = part_of(out) if len(imgs) == 1 else part_of(out)[:-9] + f"_s{j}.part.mp4"
         run(["ffmpeg", "-y", "-i", img, "-vf", vf, "-frames:v", str(end - st), "-threads", "2", *MID, seg], cwd=work)
         segs.append((seg, end - st))
-    if len(imgs) > 1:
-        f, n = xfade_chain(work, [s for s, _ in segs], [n for _, n in segs], os.path.basename(out)[:-4],
-                           tf=SF, trans=["fade"])
+    if len(imgs) == 1:
+        os.replace(segs[0][0], out)
+    else:
+        f, n = xfade_chain(work, cdir, [s for s, _ in segs], [n for _, n in segs], used, tf=SF, trans=["fade"],
+                           dest=out)
         assert n == nf, (n, nf)
-        os.replace(os.path.join(work, f), os.path.join(work, out))
+        for s, _ in segs:
+            os.remove(s)
+    return False
 
 
-def xfade_chain(work, clips, nfs, tag, tidx=0, tf=TF, trans=TRANS):
-    """Join clips with xfade; returns (file, frames). Recurses in chunks to keep filter graphs small."""
+def xfade_chain(work, cdir, clips, nfs, used, tidx=0, tf=TF, trans=TRANS, dest=None):
+    """Join clips with xfade; returns (file, frames). Recurses in chunks to keep filter graphs small.
+    The result is cached under a name derived from its inputs, so an unchanged chunk is reused."""
     if len(clips) == 1:
         return clips[0], nfs[0]
     if len(clips) > CHUNK:
         parts, pf = [], []
         for c in range(0, len(clips), CHUNK):
-            f, n = xfade_chain(work, clips[c:c + CHUNK], nfs[c:c + CHUNK], f"{tag}_{c // CHUNK}", tidx + c, tf, trans)
+            f, n = xfade_chain(work, cdir, clips[c:c + CHUNK], nfs[c:c + CHUNK], used, tidx + c, tf, trans)
             parts.append(f); pf.append(n)
-        return xfade_chain(work, parts, pf, tag + "_m", tidx + 7, tf, trans)
+        return xfade_chain(work, cdir, parts, pf, used, tidx + 7, tf, trans, dest)
+    names = [trans[(tidx + k - 1) % len(trans)] for k in range(1, len(clips))]
+    total = sum(nfs) - tf * (len(clips) - 1)
+    out = dest or os.path.join(cdir, "j_" + key_of("join", MID, FPS, tf, names, list(nfs),
+                                                    [os.path.basename(c) for c in clips]) + ".mp4")
+    used.add(os.path.normcase(out))
+    if dest is None and cache_hit(out):
+        print(f"join: cached ({len(clips)} clips)", flush=True)
+        return out, total
     cmd = ["ffmpeg", "-y"]
     for c in clips:
         cmd += ["-i", c]
     fc, prev, acc = [], "0:v", 0
     for k in range(1, len(clips)):
         acc += nfs[k - 1] - tf
-        fc.append(f"[{prev}][{k}:v]xfade=transition={trans[(tidx + k - 1) % len(trans)]}"
+        fc.append(f"[{prev}][{k}:v]xfade=transition={names[k - 1]}"
                   f":duration={tf / FPS:.4f}:offset={acc / FPS:.4f}[x{k}]")
         prev = f"x{k}"
-    total = sum(nfs) - tf * (len(clips) - 1)
-    out = f"clips/join_{tag}.mp4"
-    run(cmd + ["-filter_complex", ";".join(fc), "-map", f"[{prev}]", "-frames:v", str(total), *MID, out], cwd=work)
+    tmp = part_of(out)
+    run(cmd + ["-filter_complex", ";".join(fc), "-map", f"[{prev}]", "-frames:v", str(total), *MID, tmp], cwd=work)
+    os.replace(tmp, out)
+    if dest is None:
+        print(f"join: rendered ({len(clips)} clips)", flush=True)
     return out, total
 
 
@@ -163,10 +246,13 @@ def main():
     ap.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 4) // 2)))
     ap.add_argument("--start-from", default="clips", choices=["clips", "final"])
     ap.add_argument("--no-effects", action="store_true", help="ignore effects.json (show/focus markers)")
+    ap.add_argument("--cache-dir", default=os.path.join(tempfile.gettempdir(), "p_to_v", "_cache", "clips"))
+    ap.add_argument("--cache-max-gb", type=float, default=5.0)
     a = ap.parse_args()
 
     work, out = os.path.abspath(a.work), os.path.abspath(a.out)
-    os.makedirs(os.path.join(work, "clips"), exist_ok=True)
+    cdir = os.path.abspath(a.cache_dir)
+    os.makedirs(cdir, exist_ok=True)
     slides = sorted(p for p in glob.glob(os.path.join(work, "slides", "slide_*.png"))
                     if re.fullmatch(r"slide_\d+\.png", os.path.basename(p)))
     n = len(slides)
@@ -189,25 +275,23 @@ def main():
     total = total_f / FPS
     print(f"{n} slides, expected length {total:.2f}s ({total / 60:.1f} min)", flush=True)
 
-    # ----- clips (parallel) -----
-    clips = [f"clips/c{k:03d}.mp4" for k in range(len(items))]
-    if a.start_from == "clips":
+    # ----- clips (parallel, content-addressed cache) -----
+    if a.start_from == "clips" or (not a.no_intro and not os.path.exists(os.path.join(work, "intro.png"))):
         if not a.no_intro:
             intro_card(slides[0], os.path.join(work, "intro.png"), a.title or "簡報", a.subtitle, a.kicker)
-        mv = moves(a.zoom)
-        effects = {}
-        ep = os.path.join(work, "effects.json")
-        if os.path.exists(ep) and not a.no_effects:
-            with open(ep, encoding="utf-8") as f:
-                effects = json.load(f)
-        jobs = []
-        for k, (kind, img, nf, _) in enumerate(items):
-            if kind == "intro":
-                jobs.append(([(0, img)], clips[k], nf,
-                             ("1+0.04*(1-cos(PI*({on})/{n}))/2", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")))
-                continue
+    mv = moves(a.zoom)
+    effects = {}
+    ep = os.path.join(work, "effects.json")
+    if os.path.exists(ep) and not a.no_effects:
+        with open(ep, encoding="utf-8") as f:
+            effects = json.load(f)
+    jobs, clips, used = {}, [], set()
+    for k, (kind, img, nf, _) in enumerate(items):
+        if kind == "intro":
+            imgs, m = [(0, img)], ("1+0.04*(1-cos(PI*({on})/{n}))/2", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
+        else:
             si = k + (1 if a.no_intro else 0)          # 1-based slide number
-            imgs = [(0, img)]
+            imgs, m = [(0, img)], mv[(si - 1) % len(mv)]
             if str(si) in effects:
                 imgs = []
                 for st in effects[str(si)]:
@@ -216,13 +300,18 @@ def main():
                         imgs[-1] = (imgs[-1][0], st["img"])     # too close: keep the later state
                     else:
                         imgs.append((f0, st["img"]))
-            jobs.append((imgs, clips[k], nf, mv[(si - 1) % len(mv)]))
-        done = 0
-        with ThreadPoolExecutor(a.jobs) as ex:
-            for _ in ex.map(lambda j: render_clip(work, *j), jobs):
-                done += 1; print(f"clip {done}/{len(jobs)}", flush=True)
+        out_k = os.path.join(cdir, "c_" + clip_key(work, imgs, nf, m) + ".mp4")
+        clips.append(out_k); used.add(os.path.normcase(out_k))
+        jobs.setdefault(out_k, (imgs, nf, m))           # identical slides render once
+    done, hits = 0, 0
+    with ThreadPoolExecutor(a.jobs) as ex:
+        for hit in ex.map(lambda kv: render_clip(work, cdir, kv[1][0], kv[0], kv[1][1], kv[1][2], used),
+                          jobs.items()):
+            done += 1; hits += hit
+            print(f"clip {done}/{len(jobs)}{' (cached)' if hit else ''}", flush=True)
+    print(f"clips: {hits} cached, {len(jobs) - hits} rendered  (cache: {cdir})", flush=True)
 
-    video, vf_frames = xfade_chain(work, clips, [it[2] for it in items], "all")
+    video, vf_frames = xfade_chain(work, cdir, clips, [it[2] for it in items], used)
     assert vf_frames == total_f, (vf_frames, total_f)
 
     # ----- narration as one track at absolute positions -----
@@ -329,6 +418,7 @@ def main():
             *venc, "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-t", f"{total:.3f}", out]
     run(cmd, cwd=work)
+    prune(cdir, used, int(a.cache_max_gb * 1e9))
     print(f"done: {out}  ({total / 60:.1f} min)\nsubtitles: {srt}\nchapters: {chapters_txt}")
 
 

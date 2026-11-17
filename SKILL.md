@@ -93,7 +93,7 @@ python ".../p_to_v.py" "簡報.pptx" --work WORK --start-from tts --title "主�
 
 - 用背景執行（`run_in_background`），進度會印出 `slide i`、`clip i/n`。
 - 輸出位置預設是 pptx 旁邊的 `<檔名>_配音影片.mp4`。**已有同名檔案時不會覆蓋**，會自動改名為 `_2`、`_3`。
-- 已經合成過的句子會快取在 `WORK/tts_cache`，只改幾句時重跑很快。
+- 有快取，只會重做改到的部分（見下方「快取」）。
 - 速度參考：10 頁約 7 分鐘的影片，總共約 3–5 分鐘（每頁片段是平行算的）。
 
 ### 5. 驗證（qa 步驟會自動跑）
@@ -126,10 +126,27 @@ python ".../p_to_v.py" "簡報.pptx" --work WORK --start-from tts --title "主�
 - 每個引擎會先用一句話測試，壞掉的幾秒內就會被跳過。
 - **發生備援時，會印出 `[tts] WARNING: fell back to 'windows'`**，並記錄在 `WORK/audio/engine.txt`。看到這行，Claude 要告訴使用者「這次用的是離線備援聲音」，以及 edge 為什麼失敗。之後想換回 edge，先執行 `pip install -U edge-tts`，再從 `tts` 步驟重跑。
 - **同一支影片只會用一種聲音**：只要有一句失敗，就整批換引擎重做，不會混用兩種聲音。
-- **快取**依「引擎＋聲音＋語速＋文字」分開存放，切換引擎不會誤用別的聲音。
+- 配音快取依「引擎＋聲音＋語速＋文字」分開存放，切換引擎不會誤用別的聲音。
 - **任何引擎失敗時，前一次的配音都會保留**，不會被清空。
 - `--engine windows` 可以完全離線產出影片。
 - `python ".../p_to_v.py" --check` 會列出兩個引擎目前的狀態，以及電腦上已安裝的 Windows 聲音。
+
+## 快取
+
+配音和畫面都依**內容**快取，存在共用資料夾 `%TEMP%\p_to_v\_cache`（`--cache-dir` 可以改），所有 WORK 共用。
+
+| 快取 | 位置 | 依什麼判斷「沒變」 |
+|---|---|---|
+| 配音 | `_cache/tts` | 引擎＋聲音＋語速＋念出來的文字（每一句） |
+| 每頁片段 | `_cache/clips/c_*.mp4` | 投影片圖片內容＋這頁長度＋打亮狀態的時間點＋鏡頭運動＋編碼設定 |
+| 轉場串接 | `_cache/clips/j_*.mp4` | 輸入的片段＋轉場種類（每 10 段一組，沒變的那組直接沿用） |
+
+- **改版簡報也能沿用**：例如 `簡報_v2.pptx` 只改了第 12 頁，即使用新的 WORK，第 1–11 頁的配音和片段都會直接沿用，只重算第 12 頁、它所在的那組轉場，以及最後的合成。
+- 執行時會印出 `clips: X cached, Y rendered` 和 `join: cached/rendered`，可以確認快取有沒有命中。
+- **一定會重跑的部分**：最後合成（燒字幕、進度條、音量標準化、編碼）是對整支影片做的，無法快取；要加速這步可以用 `--encoder h264_nvenc`。
+- 改了某頁講稿，那頁長度會變，那頁的片段就會重算；其他頁不受影響。改片頭標題只會重算片頭。
+- 片段快取超過 `--cache-max-gb`（預設 5 GB）時，會刪掉最久沒用到的檔案。想強制全部重算，刪掉 `_cache\clips` 即可。
+- 舊版放在 `WORK/tts_cache` 的配音快取仍會被讀到，並自動搬進共用快取。
 
 ## 讀音字典（lexicon）
 
@@ -157,7 +174,9 @@ python ".../p_to_v.py" "簡報.pptx" --work WORK --start-from tts --title "主�
 | `--encoder` | `libx264` | 有 NVIDIA 顯卡可以用 `h264_nvenc`（`--check` 會列出可用的編碼器） |
 | `--jobs` | CPU/2（最多 8） | 同時算幾頁片段 |
 | `--slides N` | 全部 | 只做前 N 張可見投影片 |
-| `--stop-after` / `--start-from` | — | 步驟：`slides`／`script`／`tts`／`effects`／`clips`／`final`／`qa`。改了講稿或標記就從 `tts` 開始（沒改到的句子會用快取）；只改片頭標題就從 `clips` 開始 |
+| `--stop-after` / `--start-from` | — | 步驟：`slides`／`script`／`tts`／`effects`／`clips`／`final`／`qa`。改了講稿或標記就從 `tts` 開始（沒改到的句子和頁面會用快取）；只改片頭標題就從 `clips` 開始 |
+| `--cache-dir` | `%TEMP%\p_to_v\_cache` | 配音和片段的共用快取資料夾 |
+| `--cache-max-gb` | `5` | 片段快取上限，超過就刪最久沒用的 |
 
 ## 腳本一覽
 
@@ -176,6 +195,7 @@ python ".../p_to_v.py" "簡報.pptx" --work WORK --start-from tts --title "主�
   - 配音做成單一音軌，放在每頁的絕對時間點上，頁數再多也不會漂移
   - 每頁的效果狀態用 0.3 秒淡入淡出切換，鏡頭運動在整頁內保持連續
   - 燒錄 ASS 字幕，並輸出 `.srt` 和章節
+  - 每頁片段和轉場串接依內容雜湊快取，沒變的直接沿用
 - `lexicon.json`：內建讀音規則
 - `改進建議.md`：調查報告；第一、二輪已完成，剩下原生 PowerPoint 模式、Remotion
 
